@@ -1,0 +1,109 @@
+name: Drupal CI/CD with Composer and Drush on AWS EKS
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  AWS_REGION: us-east-1                # Update this to your AWS region
+  EKS_CLUSTER_NAME: drupal_self  # Update this to your EKS cluster name
+  IMAGE_NAME: drupal
+  IMAGE_TAG: latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Set up environment variables for Docker build
+        run: |
+          if [ "${{ github.ref_name }}" == "master" ]; then
+            aws secretsmanager get-secret-value --secret-id ENV_PROD --query SecretString --output text > .env
+          fi
+      - name: Set up PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer
+      - name: Verify PHP version
+        run: php -v
+      - name: Install dependencies with Composer
+        run: |
+          composer install --no-dev --optimize-autoloader
+
+      - name: Log in to Amazon ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build and push Docker image
+        env:
+          IMAGE_URI: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/$IMAGE_NAME:$IMAGE_TAG
+        run: |
+          echo $IMAGE_URI
+          docker images
+          docker build -t drupal --build-arg ENV_FILE=.env .
+          docker tag drupal:latest 521156728235.dkr.ecr.us-east-1.amazonaws.com/drupal:latest
+          docker images
+          docker push 521156728235.dkr.ecr.us-east-1.amazonaws.com/drupal:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Set namespace based on branch
+        id: namespace
+        run: |
+          if [ "${{ github.ref_name }}" == "master" ]; then
+            echo "::set-output name=namespace::production"
+          else
+            echo "No matching environment for branch"
+            exit 1
+          fi
+
+      - name: Test Kubernetes connection
+        run: kubectl cluster-info
+        
+      - name: Deploy to EKS
+        env:
+          IMAGE_URI: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        run: |
+          kubectl set image deployment/drupal-deployment drupal-container=${{ env.IMAGE_URI }} --namespace=${{ steps.namespace.outputs.namespace }}
+
+      - name: Run Drush commands for database update and config import
+        env:
+          NAMESPACE: ${{ steps.namespace.outputs.namespace }}
+        run: |
+          # Find the pod running the Drupal container
+          POD_NAME=$(kubectl get pods -n $NAMESPACE -l app=drupal -o jsonpath="{.items[0].metadata.name}")
+
+          # Run Drush commands inside the pod
+          kubectl exec -n $NAMESPACE $POD_NAME -- vendor/bin/drush updb -y
+          kubectl exec -n $NAMESPACE $POD_NAME -- vendor/bin/drush cim -y
+          kubectl exec -n $NAMESPACE $POD_NAME -- vendor/bin/drush cr
