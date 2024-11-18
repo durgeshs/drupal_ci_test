@@ -43,6 +43,7 @@ jobs:
         run: php -v
       - name: Install dependencies with Composer
         run: |
+          cd /home/runner/work/drupal_ci_test/drupal_ci_test/docroot
           composer install --no-dev --optimize-autoloader
 
       - name: Log in to Amazon ECR
