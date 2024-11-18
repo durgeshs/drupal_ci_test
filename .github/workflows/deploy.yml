@@ -32,7 +32,7 @@ jobs:
       - name: Set up environment variables for Docker build
         run: |
           if [ "${{ github.ref_name }}" == "master" ]; then
-            aws secretsmanager get-secret-value --secret-id ENV_PROD --query SecretString --output text > .env
+            echo "${{ secrets.ENV_PROD }}" > .env
           fi
       - name: Set up PHP 8.3
         uses: shivammathur/setup-php@v2
